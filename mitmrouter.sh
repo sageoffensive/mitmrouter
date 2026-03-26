@@ -31,6 +31,7 @@ SESSION_CONFIG_FILE="tmp_session_config"
 SYSTEMCTL=$(command -v systemctl || true)
 SERVICE_CMD=$(command -v service || true)
 NMCLI=$(command -v nmcli || true)
+ETHTOOL=$(command -v ethtool || true)
 ROUTER_ACTIVE=0
 
 usage() {
@@ -182,7 +183,7 @@ prompt_interface() {
             return
         fi
 
-        echo "Interface '$value' was not found. Available interfaces: $(list_candidate_interfaces | tr '\n' ' ')"
+        echo "Interface '$value' was not found. Available interfaces: $(list_candidate_interfaces | tr '\n' ' ')" >&2
     done
 }
 
@@ -197,7 +198,7 @@ prompt_ip() {
             printf "%s\n" "$value"
             return
         fi
-        echo "Please enter a valid IPv4 address."
+        echo "Please enter a valid IPv4 address." >&2
     done
 }
 
@@ -212,7 +213,7 @@ prompt_cidr() {
             printf "%s\n" "$value"
             return
         fi
-        echo "Please enter a CIDR prefix between 1 and 32."
+        echo "Please enter a CIDR prefix between 1 and 32." >&2
     done
 }
 
@@ -220,7 +221,7 @@ prompt_target_mode() {
     local value
 
     while true; do
-        read -r -p "How will the target device connect to this router? [wifi/ethernet] [${TARGET_LINK_MODE}]: " value
+        read -r -p "How will the target device connect to this router? [wifi/eth] [${TARGET_LINK_MODE}]: " value
         value=${value:-$TARGET_LINK_MODE}
         case "${value,,}" in
             wifi|w)
@@ -232,7 +233,7 @@ prompt_target_mode() {
                 return
                 ;;
             *)
-                echo "Enter 'wifi' or 'ethernet'."
+                echo "Enter 'wifi' or 'eth'."
                 ;;
         esac
     done
@@ -253,6 +254,7 @@ load_session_config() {
 }
 
 save_session_config() {
+    rm -f "$SESSION_CONFIG_FILE"
     cat <<EOF > "$SESSION_CONFIG_FILE"
 BR_IFACE=$BR_IFACE
 WAN_IFACE=$WAN_IFACE
@@ -314,6 +316,7 @@ capture_service_state() {
         if sudo "$SYSTEMCTL" is-active --quiet wpa_supplicant; then
             wpa_state="active"
         fi
+        rm -f "$SERVICE_STATE_FILE"
         cat <<EOF > "$SERVICE_STATE_FILE"
 NetworkManager=$nm_state
 wpa_supplicant=$wpa_state
@@ -327,6 +330,7 @@ capture_router_state() {
     local ip_forward
 
     ip_forward=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)
+    rm -f "$ROUTER_STATE_FILE"
     cat <<EOF > "$ROUTER_STATE_FILE"
 IP_FORWARD=$ip_forward
 EOF
@@ -379,6 +383,31 @@ set_nm_managed() {
     fi
 }
 
+make_capture_friendly() {
+    local iface=$1
+
+    if [ -z "$iface" ] || ! is_valid_interface "$iface"; then
+        return
+    fi
+
+    sudo ip link set dev "$iface" promisc on >/dev/null 2>&1 || true
+
+    if [ -n "$ETHTOOL" ]; then
+        sudo "$ETHTOOL" -K "$iface" gro off gso off tso off lro off rxvlan off txvlan off >/dev/null 2>&1 || true
+    fi
+}
+
+show_runtime_status() {
+    print_header "Runtime status"
+    echo "Bridge membership:"
+    sudo brctl show "$BR_IFACE" || true
+    echo
+    echo "Interface addresses:"
+    sudo ip -brief addr show "$BR_IFACE" "$LAN_IFACE" ${WIFI_IFACE:+$WIFI_IFACE} "$WAN_IFACE" 2>/dev/null || true
+    echo
+    echo "Capture hint: open Wireshark on '$BR_IFACE' or run: sudo tcpdump -ni $BR_IFACE"
+}
+
 reset_interfaces() {
     local iface
 
@@ -412,6 +441,7 @@ cleanup_router() {
 }
 
 write_dnsmasq_config() {
+    rm -f "$DNSMASQ_CONF"
     cat <<EOF > "$DNSMASQ_CONF"
 interface=${BR_IFACE}
 bind-interfaces
@@ -423,6 +453,7 @@ EOF
 }
 
 write_hostapd_config() {
+    rm -f "$HOSTAPD_CONF"
     cat <<EOF > "$HOSTAPD_CONF"
 interface=${WIFI_IFACE}
 bridge=${BR_IFACE}
@@ -442,11 +473,12 @@ print_configuration_summary() {
     print_header "Configuration summary"
     echo "WAN uplink interface : $WAN_IFACE"
     echo "Target link mode     : $TARGET_LINK_MODE"
-    echo "Target network iface : $LAN_IFACE"
+    echo "Target Ethernet iface: $LAN_IFACE"
     echo "Bridge interface     : $BR_IFACE"
     echo "Bridge IP            : $LAN_IP/$LAN_CIDR"
     echo "DHCP range           : $LAN_DHCP_START - $LAN_DHCP_END"
     echo "DNS server           : $LAN_DNS_SERVER"
+    echo "Capture interface    : $BR_IFACE"
     if [ "$TARGET_LINK_MODE" = "wifi" ]; then
         echo "Wi-Fi AP interface   : $WIFI_IFACE"
         echo "Wi-Fi SSID           : $WIFI_SSID"
@@ -463,7 +495,7 @@ interactive_setup() {
     echo "You will choose the uplink interface, the target-facing interface, and whether the target joins over Wi-Fi or Ethernet."
 
     WAN_IFACE=$(prompt_interface "Internet uplink interface (the side with Internet access)" "$WAN_IFACE")
-    LAN_IFACE=$(prompt_interface "Target-facing Ethernet interface" "$LAN_IFACE")
+    LAN_IFACE=$(prompt_interface "Target-side Ethernet interface to add into the bridge" "$LAN_IFACE")
     BR_IFACE=$(prompt_with_default "Bridge interface name to create" "$BR_IFACE")
 
     prompt_target_mode
@@ -478,20 +510,22 @@ interactive_setup() {
         WIFI_IFACE=""
     fi
 
-    LAN_IP=$(prompt_ip "Bridge IPv4 address" "$LAN_IP")
-    LAN_CIDR=$(prompt_cidr "Bridge CIDR prefix length" "$LAN_CIDR")
+    LAN_IP="192.168.200.1"
+    LAN_CIDR="24"
     LAN_SUBNET=$(cidr_to_netmask "$LAN_CIDR")
-    LAN_DHCP_START=$(prompt_ip "DHCP start address" "$LAN_DHCP_START")
-    LAN_DHCP_END=$(prompt_ip "DHCP end address" "$LAN_DHCP_END")
-    LAN_DNS_SERVER=$(prompt_ip "DNS server to hand to the target device" "$LAN_DNS_SERVER")
-    LAN_DHCP_LEASE=$(prompt_with_default "DHCP lease time" "$LAN_DHCP_LEASE")
+    LAN_DHCP_START="192.168.200.10"
+    LAN_DHCP_END="192.168.200.100"
+    LAN_DNS_SERVER="1.1.1.1"
+    BR_IFACE="br0"
 
     print_configuration_summary
     echo
     if [ "$TARGET_LINK_MODE" = "wifi" ]; then
         echo "Target instructions: connect the IoT device to Wi-Fi SSID '$WIFI_SSID'."
+        echo "Traffic note: the target talks through '$WIFI_IFACE', but you should capture on '$BR_IFACE'."
     else
         echo "Target instructions: plug the IoT device into Ethernet interface '$LAN_IFACE'."
+        echo "Traffic note: '$LAN_IFACE' is a bridge member. Capture on '$BR_IFACE' for a complete view."
     fi
 
     if ! prompt_yes_no "Proceed with this setup?" "yes"; then
@@ -536,6 +570,11 @@ start_router() {
     sudo brctl addbr "$BR_IFACE"
     sudo brctl addif "$BR_IFACE" "$LAN_IFACE"
     sudo ifconfig "$BR_IFACE" up
+    make_capture_friendly "$LAN_IFACE"
+    make_capture_friendly "$BR_IFACE"
+    if [ "$TARGET_LINK_MODE" = "wifi" ] && [ -n "$WIFI_IFACE" ]; then
+        make_capture_friendly "$WIFI_IFACE"
+    fi
 
     print_header "Configuring IP forwarding and NAT"
     sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
@@ -552,14 +591,17 @@ start_router() {
 
     print_header "Starting dnsmasq"
     sudo dnsmasq -C "$DNSMASQ_CONF"
+    show_runtime_status
 
     if [ "$TARGET_LINK_MODE" = "wifi" ]; then
         print_header "Starting hostapd"
+        echo "Capture traffic on '$BR_IFACE'. Wi-Fi client traffic may not be visible on '$LAN_IFACE'."
         echo "Press Ctrl+C when you want to stop the router and restore the system state."
         sudo hostapd "$HOSTAPD_CONF"
     else
         print_header "Router is ready"
         echo "The target should now be connected to '$LAN_IFACE'."
+        echo "Capture traffic on '$BR_IFACE'. '$LAN_IFACE' is attached to the bridge and may not show the full stream."
         echo "Press Ctrl+C when you want to stop the router and restore the system state."
         while true; do
             sleep 3600
